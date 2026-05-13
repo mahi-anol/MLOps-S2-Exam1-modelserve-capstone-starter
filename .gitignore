@@ -76,3 +76,4 @@ collect.py
 .dvc.dvc/cache/
 .dvc/cache/
 .dvc/cache/
+!training/features.parquet

@@ -10,15 +10,18 @@ Provisions:
   - 2 x t3.medium EC2 instances:
       * infra-host        -> Postgres, Redis, MLflow
       * monitoring-host   -> Prometheus, Grafana, FastAPI (deployed via CI/CD)
-  - 1 S3 bucket (MLflow artifact registry + Grafana provisioning files)
+  - 1 S3 bucket (MLflow artifact registry)
 
 Notes:
   - This stack does NOT create any IAM users (account has restricted access).
   - AWS credentials (configured via `aws configure`) are passed into the
-    MLflow container as env vars so it can read/write the S3 bucket.
-  - The Grafana dashboard JSON + dashboards.yml are uploaded to S3 by Pulumi
-    so the monitoring host's user-data can pull them down at boot. This
-    sidesteps the 16 KB user-data limit.
+    MLflow container AND the FastAPI container as env vars so MLflow can
+    read/write the S3 bucket and the API can download the registered model
+    artifact directly from S3 on startup.
+  - The Grafana dashboard provider config and the dashboard JSON itself are
+    baked into user-data so Grafana auto-loads the ModelServe dashboard on
+    first boot — no manual import required.
+  - User-data scripts install Docker + Compose and start the appropriate stack.
 
 Required Pulumi config:
   - aws:region                 (e.g. ap-southeast-1)
@@ -29,7 +32,9 @@ Required Pulumi config:
   - dockerImage                (e.g. mahianol/modelserve-api:latest)
 """
 
+import json
 import os
+
 import pulumi
 import pulumi_aws as aws
 
@@ -48,8 +53,33 @@ region = aws_cfg.get("region") or "ap-southeast-1"
 
 project = "modelserve"
 
-# Repo root (one level up from this file's "infrastructure/" folder)
-_repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# ---------------------------------------------------------------------------
+# Read the local Grafana dashboard JSON so we can bake it into user-data.
+# Path is resolved relative to THIS file (not the cwd), so it works regardless
+# of where `pulumi up` is invoked from.
+# ---------------------------------------------------------------------------
+_dashboard_json_path = os.path.normpath(
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "monitoring",
+        "grafana",
+        "provisioning",
+        "dashboards",
+        "modelserve-dashboard.json",
+    )
+)
+try:
+    with open(_dashboard_json_path, "r") as _f:
+        # Minify the dashboard JSON so it fits well within the 16 KB EC2
+        # user-data limit alongside the rest of the script.
+        dashboard_json_minified = json.dumps(json.load(_f), separators=(",", ":"))
+except FileNotFoundError:
+    pulumi.log.warn(
+        f"Grafana dashboard JSON not found at {_dashboard_json_path} — "
+        "Grafana will start with no pre-provisioned dashboard."
+    )
+    dashboard_json_minified = ""
 
 # ---------------------------------------------------------------------------
 # Networking
@@ -168,14 +198,16 @@ key_pair = aws.ec2.KeyPair(
 )
 
 # ---------------------------------------------------------------------------
-# S3 Bucket (MLflow artifact registry + Grafana provisioning files)
+# S3 Bucket (MLflow artifact registry)
 # ---------------------------------------------------------------------------
+# Pulumi auto-appends a random suffix to keep the bucket name unique.
 artifact_bucket = aws.s3.BucketV2(
     f"{project}-artifacts",
     force_destroy=True,
     tags={"Name": f"{project}-artifacts"},
 )
 
+# Block public access (good default)
 aws.s3.BucketPublicAccessBlock(
     f"{project}-artifacts-pab",
     bucket=artifact_bucket.id,
@@ -183,25 +215,6 @@ aws.s3.BucketPublicAccessBlock(
     block_public_policy=True,
     ignore_public_acls=True,
     restrict_public_buckets=True,
-)
-
-# Upload Grafana provisioning files so the monitoring host can fetch them at boot.
-grafana_dashboard_obj = aws.s3.BucketObject(
-    f"{project}-grafana-dashboard",
-    bucket=artifact_bucket.id,
-    key="grafana/modelserve-dashboard.json",
-    source=pulumi.FileAsset(
-        os.path.join(_repo_root, "monitoring/grafana/provisioning/dashboards/modelserve-dashboard.json")
-    ),
-)
-
-grafana_dashboards_yml_obj = aws.s3.BucketObject(
-    f"{project}-grafana-dashboards-yml",
-    bucket=artifact_bucket.id,
-    key="grafana/dashboards.yml",
-    source=pulumi.FileAsset(
-        os.path.join(_repo_root, "monitoring/grafana/provisioning/dashboards/dashboards.yml")
-    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -329,10 +342,12 @@ docker compose --env-file .env up -d
 def make_monitoring_userdata(args) -> str:
     """User-data for EC2 #2: runs Prometheus, Grafana, and the FastAPI image.
 
-    Also pulls the Grafana dashboard provisioning files from S3 so the
-    dashboard shows up automatically once Grafana boots.
+    The API container needs AWS credentials so that MLflow can fetch the
+    registered model artifact directly from S3 on startup. Without them
+    `mlflow.pyfunc.load_model("models:/<name>/Production")` will fail and
+    `/health` will report unhealthy.
     """
-    infra_private_ip, image, bucket_name, akid, sak = args
+    infra_private_ip, image, akid, sak = args
 
     prom_yaml = f"""global:
   scrape_interval: 15s
@@ -351,6 +366,7 @@ scrape_configs:
         labels:
           service: 'modelserve-api'
 """
+
     grafana_ds = """apiVersion: 1
 datasources:
   - name: Prometheus
@@ -361,14 +377,35 @@ datasources:
     isDefault: true
     editable: true
 """
+
+    # Grafana dashboard provider: tells Grafana to load every dashboard JSON
+    # it finds in /etc/grafana/provisioning/dashboards. The dashboard JSON
+    # itself is written to the same directory below.
+    grafana_dashboards_provider = """apiVersion: 1
+
+providers:
+  - name: ModelServe
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false
+"""
+
+    # The dashboard JSON was loaded + minified at module level. Embed it as a
+    # quoted heredoc so bash doesn't try to expand $variables or backticks
+    # inside the JSON content. (We verified the minified JSON contains no
+    # single quotes and no 'DASHBOARD' marker, so this is safe.)
+    write_dashboard_block = ""
+    if dashboard_json_minified:
+        write_dashboard_block = f"""cat > /opt/modelserve/grafana/provisioning/dashboards/modelserve-dashboard.json <<'DASHBOARD'
+{dashboard_json_minified}
+DASHBOARD
+"""
+
     return f"""#!/bin/bash
 {_common_docker_install()}
-
-# AWS CLI is needed to pull the dashboard JSON from S3.
-apt-get install -y awscli
-export AWS_ACCESS_KEY_ID="{akid}"
-export AWS_SECRET_ACCESS_KEY="{sak}"
-export AWS_DEFAULT_REGION="{region}"
 
 mkdir -p /opt/modelserve/prometheus
 mkdir -p /opt/modelserve/grafana/provisioning/datasources
@@ -382,21 +419,26 @@ cat > /opt/modelserve/grafana/provisioning/datasources/prometheus.yml <<'DS'
 {grafana_ds}
 DS
 
-# Pull Grafana dashboard provisioning files from S3
-aws s3 cp "s3://{bucket_name}/grafana/dashboards.yml" \\
-  /opt/modelserve/grafana/provisioning/dashboards/dashboards.yml
-aws s3 cp "s3://{bucket_name}/grafana/modelserve-dashboard.json" \\
-  /opt/modelserve/grafana/provisioning/dashboards/modelserve-dashboard.json
+cat > /opt/modelserve/grafana/provisioning/dashboards/dashboards.yml <<'DBPROV'
+{grafana_dashboards_provider}
+DBPROV
 
+{write_dashboard_block}
 # Default endpoints (private VPC IP of the infra host). CI/CD can override these
 # by writing a different .env file before running `docker compose up -d api`.
+# AWS credentials are required so the API can pull the registered model
+# artifact from S3 via MLflow on startup.
 cat > /opt/modelserve/.env <<ENV
 MLFLOW_TRACKING_URI=http://{infra_private_ip}:5000
 REDIS_HOST={infra_private_ip}
 REDIS_PORT=6379
 MLFLOW_MODEL_NAME=fraud-detection-model
 API_IMAGE={image}
+AWS_ACCESS_KEY_ID={akid}
+AWS_SECRET_ACCESS_KEY={sak}
+AWS_DEFAULT_REGION={region}
 ENV
+chmod 600 /opt/modelserve/.env
 
 cat > /opt/modelserve/docker-compose.yml <<'YAML'
 services:
@@ -409,6 +451,9 @@ services:
       FEAST_REPO_PATH: /app/feast_repo
       REDIS_HOST: ${{REDIS_HOST}}
       REDIS_PORT: ${{REDIS_PORT}}
+      AWS_ACCESS_KEY_ID: ${{AWS_ACCESS_KEY_ID}}
+      AWS_SECRET_ACCESS_KEY: ${{AWS_SECRET_ACCESS_KEY}}
+      AWS_DEFAULT_REGION: ${{AWS_DEFAULT_REGION}}
     # The baked Feast config inside the image points at "redis:6379".
     # We map that hostname to the infra EC2's private IP so the API can
     # reach the real Redis without needing to rewrite the image.
@@ -458,8 +503,8 @@ YAML
 cd /opt/modelserve
 # Pull API image best-effort (it may not exist yet on first boot — CI/CD will deploy it later).
 docker pull {image} || true
-docker compose up -d prometheus grafana
-docker compose up -d api || echo "API image not yet available — will be deployed by CI/CD."
+docker compose --env-file .env up -d prometheus grafana
+docker compose --env-file .env up -d api || echo "API image not yet available — will be deployed by CI/CD."
 """
 
 
@@ -486,7 +531,6 @@ infra_host = aws.ec2.Instance(
 monitoring_userdata = pulumi.Output.all(
     infra_host.private_ip,
     pulumi.Output.from_input(docker_image),
-    artifact_bucket.bucket,
     aws_access_key_id,
     aws_secret_access_key,
 ).apply(make_monitoring_userdata)
@@ -502,11 +546,7 @@ monitoring_host = aws.ec2.Instance(
     root_block_device={"volume_size": 30, "volume_type": "gp3"},
     user_data=monitoring_userdata,
     tags={"Name": f"{project}-monitoring-host", "Role": "prometheus-grafana-api"},
-    opts=pulumi.ResourceOptions(depends_on=[
-        infra_host,
-        grafana_dashboard_obj,
-        grafana_dashboards_yml_obj,
-    ]),
+    opts=pulumi.ResourceOptions(depends_on=[infra_host]),
 )
 
 # ---------------------------------------------------------------------------
