@@ -146,7 +146,7 @@ stages:
     outs:
     - path: training/features.parquet
       hash: md5
-      md5: 20cf25cfb4cdea21c6f09264256ba6dd
+      md5: fb5399e2a1f94a7bab4a4fd668226d90
       size: 83358
   model_training:
     cmd: python -m src.Pipelines.Model_Training.model_training

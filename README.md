@@ -9,7 +9,7 @@ Built with FastAPI, MLflow, Feast, Redis, Postgres, Prometheus, Grafana, Docker,
 
 ## Architecture
 
-Infra lives in AWS. Training happens on your local machine and pushes the model to the remote MLflow registry. The FastAPI image is built + pushed by GitHub Actions on every push to `main`, then pulled and run on the monitoring EC2 host.
+Infra lives in AWS. Training happens on your local machine and pushes the model to the remote MLflow registry (artifacts go to S3). The FastAPI image is built + pushed by GitHub Actions on every push to `main`, then pulled and run on the monitoring EC2 host.
 
 ```
                              AWS
@@ -37,6 +37,8 @@ Infra lives in AWS. Training happens on your local machine and pushes the model 
         │ (training)   │         │ on push to main │
         └──────────────┘         └─────────────────┘
 ```
+
+See `docs/ARCHITECTURE.md` for ADRs and design rationale.
 
 ---
 
@@ -87,6 +89,8 @@ git commit -m "training: refresh model + feature registry"
 git push origin main
 ```
 
+Re-running `bootstrap_train.sh` later registers a **new** version of `fraud-detection-model` in MLflow. The new version is promoted to `Production` and the older one is archived — the rollback endpoint (below) lets you switch back to a previous version without retraining.
+
 ### Step 3 — Push to `main` (GitHub Actions does the rest)
 
 On push, `.github/workflows/deploy.yml`:
@@ -113,12 +117,13 @@ Done. Hit the endpoints.
 
 Replace `<API_HOST>` with the `api_url` Pulumi output (i.e. `monitoring_host_public_ip:8000`).
 
-| Endpoint                            | Method | Description                              |
-|-------------------------------------|--------|------------------------------------------|
-| `/health`                           | GET    | Health check + current model version     |
-| `/predict`                          | POST   | Predict fraud for `{"entity_id": <cc>}`  |
-| `/predict/{entity_id}?explain=true` | GET    | Predict + feature values used            |
-| `/metrics`                          | GET    | Prometheus exposition                    |
+| Endpoint                            | Method | Description                                          |
+|-------------------------------------|--------|------------------------------------------------------|
+| `/health`                           | GET    | Health check + current model version                 |
+| `/predict`                          | POST   | Predict fraud for `{"entity_id": <cc>}`              |
+| `/predict/{entity_id}?explain=true` | GET    | Predict + feature values used                        |
+| `/rollback`                         | POST   | Switch to a previous MLflow model version            |
+| `/metrics`                          | GET    | Prometheus exposition                                |
 
 ```bash
 curl http://<API_HOST>/health
@@ -127,6 +132,39 @@ curl -X POST http://<API_HOST>/predict \
   -H 'Content-Type: application/json' \
   -d @training/sample_request.json
 ```
+
+### Rollback
+
+`POST /rollback` switches the currently-served model to a previous version registered in MLflow — no container restart, no redeploy. It also updates the MLflow Model Registry so a future restart comes up on the rolled-back version.
+
+```bash
+# Roll back to the most recent prior version (auto-pick)
+curl -X POST http://<API_HOST>/rollback
+
+# Roll back to a specific version
+curl -X POST http://<API_HOST>/rollback \
+  -H 'Content-Type: application/json' \
+  -d '{"version": "2"}'
+```
+
+Response:
+```json
+{
+  "status": "ok",
+  "model_name": "fraud-detection-model",
+  "previous_version": "3",
+  "current_version": "2",
+  "timestamp": "2025-..."
+}
+```
+
+What it does, in order:
+1. Resolves the target version (explicit `version` from body, else the most recent registered version that isn't currently loaded).
+2. Loads that version into the live FastAPI process via `mlflow.pyfunc.load_model`.
+3. Promotes the target to MLflow stage `Production` and archives the version that was previously serving.
+4. Updates the `model_version_info` Prometheus gauge so `/health` and Grafana reflect the new active version immediately.
+
+Returns `400` if the requested version doesn't exist or there's no prior version to roll back to. If the in-memory load fails, the previously-loaded model keeps serving traffic (no half-swapped state).
 
 ---
 
@@ -175,6 +213,11 @@ This is no longer the primary path. Production now uses the two-script + CI flow
 ```
 modelserve/
 ├── app/                          # FastAPI inference service
+│   ├── main.py                   # Endpoints (/health, /predict, /rollback, /metrics)
+│   ├── model_loader.py           # MLflow model loader + rollback logic
+│   ├── feature_client.py         # Feast online-store client
+│   ├── metrics.py                # Prometheus metrics
+│   └── schemas.py                # Pydantic request/response models
 ├── src/Pipelines/                # DVC pipeline stages
 ├── feast_repo/                   # Feast config + feature definitions
 ├── training/                     # train.py entrypoint + artifacts
@@ -182,13 +225,17 @@ modelserve/
 │   ├── Pulumi.yaml
 │   ├── __main__.py               # VPC, EC2 x2, S3, SG, key pair
 │   └── requirements.txt
-├── monitoring/                   # Prometheus + Grafana config (local fallback)
+├── monitoring/                   # Prometheus + Grafana config
+│   ├── prometheus/               # prometheus.yml, alerts.yml
+│   └── grafana/provisioning/     # auto-provisioned datasource + dashboard
 ├── scripts/
 │   ├── bootstrap_infra.sh        # Script 1 — provision AWS infra
 │   ├── bootstrap_train.sh        # Script 2 — train + register model
 │   └── materialize_features.py
 ├── docker/mlflow/                # (local fallback)
 ├── docs/
+│   ├── ARCHITECTURE.md           # ADRs + design rationale
+│   └── GRAFANA_SETUP.md          # Dashboard guide
 ├── .github/workflows/deploy.yml  # CI/CD: test → build → push → deploy
 ├── docker-compose.yml            # Local-only dev stack
 ├── Dockerfile                    # FastAPI image (built by CI)
@@ -217,5 +264,5 @@ Tests mock MLflow and Feast — no infra required.
 
 ## Docs
 
-- `docs/ARCHITECTURE.md` — ADRs, design rationale (still describes the single-EC2 topology; the high-level flow is unchanged)
-- `docs/GRAFANA_SETUP.md` — dashboard creation guide
+- `docs/ARCHITECTURE.md` — two-EC2 AWS topology, ADRs, design rationale
+- `docs/GRAFANA_SETUP.md` — dashboard provisioning + custom panels guide

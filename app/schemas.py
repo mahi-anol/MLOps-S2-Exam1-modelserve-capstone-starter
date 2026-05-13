@@ -33,6 +33,27 @@ class HealthResponse(BaseModel):
     model_version: str = Field(..., description="Currently loaded model version")
 
 
+class RollbackRequest(BaseModel):
+    """POST /rollback request body. Both fields are optional."""
+    version: Optional[str] = Field(
+        default=None,
+        description=(
+            "Specific MLflow model version to roll back to (e.g. \"2\"). "
+            "If omitted, the service rolls back to the most recent version "
+            "that isn't currently loaded."
+        ),
+    )
+
+
+class RollbackResponse(BaseModel):
+    """POST /rollback response body."""
+    status: str = Field(default="ok")
+    model_name: str = Field(..., description="MLflow registered model name")
+    previous_version: str = Field(..., description="Version that was serving before rollback")
+    current_version: str = Field(..., description="Version now serving traffic")
+    timestamp: str = Field(..., description="Rollback timestamp in ISO 8601")
+
+
 class ErrorResponse(BaseModel):
     """Error response body."""
     error: str

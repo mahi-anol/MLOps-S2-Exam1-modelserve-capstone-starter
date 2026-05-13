@@ -81,7 +81,7 @@ sed -i "s|connection_string:.*|connection_string: ${REDIS_HOST}:6379|" feast_rep
 # --- Step 4: DVC pipeline ---
 echo "[4/5] Running DVC pipeline (this trains and registers the model)..."
 dvc init -f --no-scm
-dvc repro
+dvc repro -f
 
 # --- Step 5: Feast apply + materialize ---
 echo "[5/5] feast apply + materialize features to remote Redis..."

@@ -2,111 +2,122 @@
 
 ## Access Grafana
 
-Open `http://localhost:3000` (or `http://<EC2-IP>:3000`).
-Default credentials: `admin` / `admin`. Change the password on first login.
+Grafana runs on the **monitoring-host** EC2 (EC2 #2). Open:
 
-The Prometheus datasource is auto-provisioned — no manual datasource setup needed.
+```
+http://<monitoring_host_public_ip>:3000
+```
 
----
+(or `http://localhost:3000` for the local-compose flow.) Default credentials: `admin` / `admin`. Change the password on first login.
 
-## Required Dashboard: ModelServe Inference Monitoring
+Both the Prometheus datasource **and** the ModelServe dashboard are auto-provisioned from `monitoring/grafana/provisioning/` — when Grafana starts you'll find a dashboard called **ModelServe Monitoring** already loaded, pre-wired to the Prometheus datasource. No manual setup needed for the default panels.
 
-You need at least one dashboard with panels for prediction latency, error rate, throughput, and model info.
-
-### Step 1: Create a New Dashboard
-
-1. Click the **+** icon in the left sidebar → **New dashboard**
-2. Click **Add visualization**
-3. Select **Prometheus** as the data source
-
-### Step 2: Add Panels
-
-Create these panels (one at a time: Add visualization → configure → Apply → repeat):
-
-**Panel 1: Request Rate (requests/sec)**
-- Title: `Prediction Throughput`
-- Query: `rate(prediction_requests_total[5m])`
-- Visualization: Time series
-- Legend: `{{method}} {{endpoint}} {{status}}`
-
-**Panel 2: P95 Latency**
-- Title: `P95 Prediction Latency`
-- Query: `histogram_quantile(0.95, rate(prediction_duration_seconds_bucket[5m]))`
-- Visualization: Time series
-- Unit: seconds (under Standard options → Unit → Time → seconds)
-
-**Panel 3: Average Latency**
-- Title: `Average Prediction Latency`
-- Query: `rate(prediction_duration_seconds_sum[5m]) / rate(prediction_duration_seconds_count[5m])`
-- Visualization: Stat or Gauge
-- Unit: seconds
-
-**Panel 4: Error Rate**
-- Title: `Prediction Errors`
-- Query: `rate(prediction_errors_total[5m])`
-- Visualization: Time series
-- Legend: `{{error_type}}`
-
-**Panel 5: Feast Hit/Miss Ratio**
-- Title: `Feature Store Hit Rate`
-- Query A: `rate(feast_online_store_hits_total[5m])` (legend: Hits)
-- Query B: `rate(feast_online_store_misses_total[5m])` (legend: Misses)
-- Visualization: Time series
-
-**Panel 6: Model Version**
-- Title: `Active Model Version`
-- Query: `model_version_info`
-- Visualization: Stat
-- Legend: `{{version}}`
-
-**Panel 7: Total Requests (counter)**
-- Title: `Total Predictions`
-- Query: `prediction_requests_total`
-- Visualization: Stat
-- Calculation: Last (not null)
-
-### Step 3: Arrange Panels
-
-Drag and resize panels into a clean layout. A common arrangement is two rows: latency metrics on top, throughput and errors on the bottom.
-
-### Step 4: Save the Dashboard
-
-Click the **save** icon (floppy disk) → name it `ModelServe Monitoring` → Save.
+The rest of this guide covers (1) what's in the provisioned dashboard, (2) how to add custom panels on top, and (3) how to keep your changes in version control.
 
 ---
 
-## Generate Load for Demo
+## What's in the provisioned dashboard
 
-To see data in your dashboard, generate some prediction traffic:
+`monitoring/grafana/provisioning/dashboards/modelserve-dashboard.json` ships with panels covering all metrics the FastAPI service exposes:
+
+| Panel                          | PromQL                                                                                       |
+|--------------------------------|----------------------------------------------------------------------------------------------|
+| Prediction Throughput          | `rate(prediction_requests_total[5m])`                                                        |
+| P95 Prediction Latency         | `histogram_quantile(0.95, rate(prediction_duration_seconds_bucket[5m]))`                     |
+| Average Prediction Latency     | `rate(prediction_duration_seconds_sum[5m]) / rate(prediction_duration_seconds_count[5m])`    |
+| Prediction Errors              | `rate(prediction_errors_total[5m])`  (legend: `{{error_type}}`)                              |
+| Feature Store Hit Rate         | `rate(feast_online_store_hits_total[5m])` vs `rate(feast_online_store_misses_total[5m])`     |
+| Active Model Version           | `model_version_info`  (legend: `{{version}}`)                                                |
+| Total Predictions              | `prediction_requests_total`                                                                  |
+
+The `error_type` label on `prediction_errors_total` includes `feature_not_found`, `prediction_error`, and `rollback_error`, so the errors panel distinguishes feature-store misses, model-inference failures, and failed rollback attempts.
+
+The **Active Model Version** panel is wired to the same `model_version_info` gauge that the `POST /rollback` endpoint updates — so when you roll back to a previous version, the panel re-paints with the new version label within one scrape interval (≤5s by default).
+
+---
+
+## Adding custom panels
+
+If you want to extend the dashboard:
+
+1. Open the **ModelServe Monitoring** dashboard.
+2. Click **Add → Visualization**.
+3. Select **Prometheus** as the data source (already provisioned).
+4. Add a query, configure the panel, click **Apply**.
+
+A few useful extras that aren't in the default set:
+
+**Rollback events over time**
+- Query: `changes(model_version_info[1h])`
+- Visualization: Time series
+- Counts how often the active model version label changes — useful for spotting frequent rollbacks.
+
+**Failed rollback attempts**
+- Query: `rate(prediction_errors_total{error_type="rollback_error"}[5m])`
+- Visualization: Stat or Time series
+- Flags rollbacks that hit a bad version or registry error.
+
+**Endpoint-level error rate**
+- Query: `sum by (endpoint) (rate(prediction_requests_total{status="error"}[5m]))`
+- Visualization: Time series
+- Splits errors by `/predict` vs `/predict/{entity_id}`.
+
+---
+
+## Generate load for a demo
+
+To populate the panels with data, generate some prediction traffic against the API:
 
 ```bash
+API=http://<monitoring_host_public_ip>:8000   # or http://localhost:8000 locally
+
 # Single request
-curl -X POST http://localhost:8000/predict \
+curl -X POST $API/predict \
   -H "Content-Type: application/json" \
   -d @training/sample_request.json
 
 # Load test (100 requests)
 ENTITY_ID=$(python3 -c "import json; print(json.load(open('training/sample_request.json'))['entity_id'])")
 for i in $(seq 1 100); do
-  curl -s -X POST http://localhost:8000/predict \
+  curl -s -X POST $API/predict \
     -H "Content-Type: application/json" \
     -d "{\"entity_id\": $ENTITY_ID}" > /dev/null
 done
 echo "Sent 100 requests"
 ```
 
-Wait 30 seconds, then refresh the dashboard. You should see data populating.
+Wait one scrape interval (Prometheus is configured for 5s on the `modelserve-api` job), then refresh the dashboard.
+
+To demo the **Active Model Version** panel updating, trigger a rollback while a load loop is running:
+
+```bash
+curl -X POST $API/rollback
+```
+
+The panel re-paints with the new version label within ~5 seconds, and `Prediction Throughput` keeps climbing — proving the swap was in-process and didn't drop traffic.
 
 ---
 
-## Export Dashboard JSON (for Version Control)
+## Persisting UI changes back to version control
 
-After creating your dashboard:
+The dashboard JSON in the repo is what Grafana loads on startup. If you tweak panels in the UI and want those changes to survive a container rebuild:
 
-1. Open the dashboard
-2. Click the **share** icon (or Settings gear → JSON Model)
-3. Copy the JSON
-4. Save to `monitoring/grafana/dashboards/modelserve-dashboard.json`
-5. Commit to git
+1. Open the dashboard.
+2. Click the **share** icon (or **Dashboard settings → JSON Model**).
+3. Copy the JSON.
+4. Overwrite `monitoring/grafana/provisioning/dashboards/modelserve-dashboard.json` with it.
+5. Commit and push — the next CI deploy (or a `docker compose up -d --force-recreate grafana`) will pick up the new dashboard.
 
-This way your dashboard is reproducible even if the Grafana volume is wiped.
+This keeps the dashboard reproducible across Grafana volume wipes and EC2 replacements.
+
+---
+
+## Alerts
+
+Prometheus alert rules live in `monitoring/prometheus/alerts.yml` and are loaded automatically by the Prometheus container. The shipped rules cover:
+
+- **HighLatencyP95** — P95 latency > 500ms for 1 minute (warning)
+- **HighErrorRate** — `prediction_errors_total` rate > 0.1/s for 2 minutes (critical)
+- **ServiceDown** — `up{job="modelserve-api"} == 0` for 1 minute (critical)
+
+You can view firing alerts at `http://<monitoring_host_public_ip>:9090/alerts`. Routing them to Slack / email requires running Alertmanager — not configured in this repo.

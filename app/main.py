@@ -7,6 +7,7 @@ Endpoints:
   GET  /health                          → Health check with model version
   POST /predict                         → Predict fraud for entity_id
   GET  /predict/{entity_id}?explain=true → Predict with feature explanation
+  POST /rollback                        → Switch to a previous model version
   GET  /metrics                         → Prometheus metrics
 
 Design:
@@ -29,6 +30,8 @@ from app.schemas import (
     PredictResponse,
     ExplainResponse,
     HealthResponse,
+    RollbackRequest,
+    RollbackResponse,
     ErrorResponse,
 )
 from app.model_loader import ModelLoader
@@ -203,6 +206,64 @@ async def predict_explain(entity_id: int, explain: bool = False):
         ).inc()
         logger.error(f"Explain prediction failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── POST /rollback ──────────────────────────────────────────────────────────
+
+@app.post(
+    "/rollback",
+    response_model=RollbackResponse,
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+)
+async def rollback(request: RollbackRequest | None = None):
+    """
+    Switch the currently-served model to a previous MLflow version.
+
+    Body (all fields optional):
+        { "version": "2" }   → roll back to that specific version
+        { }    or no body    → roll back to the most recent prior version
+
+    Side effects:
+      - Loads the target version into the live process (no restart needed)
+      - Promotes the target version to MLflow stage `Production`
+      - Archives the version that was previously serving
+      - Updates the `model_version_info` Prometheus gauge
+
+    Returns 400 if the request asks for a version that doesn't exist or
+    there is no prior version to roll back to. Returns 500 on any other
+    failure during the load; in that case the previously-loaded model
+    keeps serving traffic.
+    """
+    target_version = request.version if request is not None else None
+    previous_version_for_gauge = model_loader.model_version
+
+    try:
+        result = model_loader.rollback(target_version=target_version)
+    except RuntimeError as e:
+        # Expected failures: version not found / nothing to roll back to.
+        prediction_errors_total.labels(error_type="rollback_error").inc()
+        logger.warning(f"Rollback rejected: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        prediction_errors_total.labels(error_type="rollback_error").inc()
+        logger.error(f"Rollback failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Update Prometheus gauge — clear the old label, set the new one.
+    try:
+        model_version_info.remove(previous_version_for_gauge)
+    except KeyError:
+        # Gauge wasn't set for that label — fine, ignore.
+        pass
+    model_version_info.labels(version=result["current_version"]).set(1)
+
+    return RollbackResponse(
+        status="ok",
+        model_name=result["model_name"],
+        previous_version=result["previous_version"],
+        current_version=result["current_version"],
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
 
 
 # ─── Metrics ─────────────────────────────────────────────────────────────────
