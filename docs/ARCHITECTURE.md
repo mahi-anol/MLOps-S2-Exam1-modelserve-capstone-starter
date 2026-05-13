@@ -6,44 +6,61 @@ ModelServe is a production ML serving platform for credit card fraud detection. 
 
 The system runs on AWS across **two EC2 instances** inside a Pulumi-managed VPC. CI/CD is handled by GitHub Actions (build → push to Docker Hub → SSH deploy to EC2 #2). Observability is provided by Prometheus + Grafana, both running on EC2 #2 alongside the API.
 
-```
-                              AWS  (Pulumi-managed VPC)
-┌──────────────────────────────────────────────────────────────────────┐
-│  VPC 10.0.0.0/16  • public + private subnets  • IGW • NAT • SG      │
-│                                                                      │
-│  ┌──────────────────────────┐      ┌────────────────────────────┐    │
-│  │ EC2 #1: infra-host       │      │ EC2 #2: monitoring-host    │    │
-│  │   • Postgres (MLflow DB) │      │   • Prometheus             │    │
-│  │   • Redis    (Feast)     │ ◄─── │   • Grafana                │    │
-│  │   • MLflow   (S3 root)   │      │   • FastAPI (Docker Hub)   │    │
-│  └────────────┬─────────────┘      └────────────────────────────┘    │
-│               │                                                      │
-│               ▼                                                      │
-│        ┌────────────┐                                                │
-│        │ S3 bucket  │  ◄── MLflow artifact store                     │
-│        └────────────┘                                                │
-└──────────────────────────────────────────────────────────────────────┘
-        ▲                                       ▲
-        │ pulumi up (local)                     │ SSH + docker pull
-        │ bootstrap_train.sh (local)            │ GitHub Actions
-        │ → MLflow registry + Feast materialize │ on push to main
-        │                                       │
-   Local machine                          GitHub Actions runner
+```mermaid
+flowchart TB
+    subgraph Local["💻 Local Machine"]
+        LM["pulumi up<br/>bootstrap_train.sh<br/>→ MLflow registry<br/>→ Feast materialize"]
+    end
 
-Offline Pipeline  (runs locally via bootstrap_train.sh → dvc repro):
+    subgraph GHA["⚙️ GitHub Actions Runner"]
+        GH["SSH + docker pull<br/>(on push to main)"]
+    end
 
-  Kaggle Dataset
-       │
-       ▼
-  data_ingestion ──► data_preprocessing ──► feature_engineering
-                                                    │
-                                                    ▼
-                                            feast_preprocess
-                                                    │
-                                                    ▼
-                                            model_training
-                                  (logs run + registers model in MLflow
-                                   with stage Production; artifacts → S3)
+    subgraph AWS["☁️ AWS — Pulumi-managed VPC (10.0.0.0/16)"]
+        direction TB
+        subgraph VPC["Public + Private Subnets • IGW • NAT • SG"]
+            direction LR
+            subgraph EC2_1["🖥️ EC2 #1: infra-host"]
+                PG[("🐘 Postgres<br/>MLflow DB")]
+                RD[("🔴 Redis<br/>Feast")]
+                ML["📊 MLflow<br/>S3 root"]
+            end
+            subgraph EC2_2["🖥️ EC2 #2: monitoring-host"]
+                PR["📈 Prometheus"]
+                GR["📉 Grafana"]
+                API["⚡ FastAPI<br/>Docker Hub"]
+            end
+            EC2_2 -->|scrape / query| EC2_1
+        end
+        S3[("🪣 S3 Bucket<br/>MLflow Artifacts")]
+        EC2_1 --> S3
+    end
+
+    subgraph Pipeline["🔁 Offline Pipeline (bootstrap_train.sh → dvc repro)"]
+        direction TB
+        K["📦 Kaggle Dataset"] --> DI["data_ingestion"]
+        DI --> DP["data_preprocessing"]
+        DP --> FE["feature_engineering"]
+        FE --> FP["feast_preprocess"]
+        FP --> MT["🎯 model_training<br/>(logs run + registers model<br/>Stage: Production<br/>artifacts → S3)"]
+    end
+
+    LM ==>|deploys infra & trains| AWS
+    GH ==>|deploys API| EC2_2
+    Pipeline -.->|registers model| ML
+    MT -.->|uploads artifacts| S3
+
+    classDef awsBox fill:#FF9900,stroke:#232F3E,stroke-width:2px,color:#fff
+    classDef ec2Box fill:#EC7211,stroke:#232F3E,stroke-width:1px,color:#fff
+    classDef storeBox fill:#3B48CC,stroke:#232F3E,stroke-width:1px,color:#fff
+    classDef pipelineBox fill:#1168BD,stroke:#0B4884,stroke-width:1px,color:#fff
+    classDef localBox fill:#4CAF50,stroke:#2E7D32,stroke-width:1px,color:#fff
+
+    class AWS awsBox
+    class EC2_1,EC2_2 ec2Box
+    class S3,PG,RD storeBox
+    class K,DI,DP,FE,FP,MT pipelineBox
+    class LM,GH localBox
 ```
 
 The FastAPI container on EC2 #2 reaches Postgres / Redis / MLflow on EC2 #1 over the **private VPC IP**, exposed to the container via `extra_hosts` in `docker-compose.yml` so the Feast config baked into the image (`connection_string: redis:6379`) resolves correctly.
