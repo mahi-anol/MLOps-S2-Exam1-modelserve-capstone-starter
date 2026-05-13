@@ -343,11 +343,17 @@ def make_monitoring_userdata(args) -> str:
     """User-data for EC2 #2: runs Prometheus, Grafana, and the FastAPI image.
 
     The API container needs AWS credentials so that MLflow can fetch the
-    registered model artifact directly from S3 on startup. Without them
-    `mlflow.pyfunc.load_model("models:/<name>/Production")` will fail and
-    `/health` will report unhealthy.
+    registered model artifact directly from S3 on startup. Those credentials
+    are NOT baked into user-data — they're injected by the CI/CD workflow
+    (GitHub Actions) into `/opt/modelserve/api.env` from GitHub Secrets on
+    every deploy. The compose file references that file via `env_file:`.
+
+    On first boot the api.env file doesn't exist yet, so we create an empty
+    placeholder so `docker compose up` doesn't error out. The api container
+    will start but its `/health` will report unhealthy until CI/CD runs and
+    populates the real credentials.
     """
-    infra_private_ip, image, akid, sak = args
+    infra_private_ip, image = args
 
     prom_yaml = f"""global:
   scrape_interval: 15s
@@ -404,63 +410,30 @@ providers:
 DASHBOARD
 """
 
-    return f"""#!/bin/bash
-{_common_docker_install()}
-
-mkdir -p /opt/modelserve/prometheus
-mkdir -p /opt/modelserve/grafana/provisioning/datasources
-mkdir -p /opt/modelserve/grafana/provisioning/dashboards
-
-cat > /opt/modelserve/prometheus/prometheus.yml <<'PROM'
-{prom_yaml}
-PROM
-
-cat > /opt/modelserve/grafana/provisioning/datasources/prometheus.yml <<'DS'
-{grafana_ds}
-DS
-
-cat > /opt/modelserve/grafana/provisioning/dashboards/dashboards.yml <<'DBPROV'
-{grafana_dashboards_provider}
-DBPROV
-
-{write_dashboard_block}
-# Default endpoints (private VPC IP of the infra host). CI/CD can override these
-# by writing a different .env file before running `docker compose up -d api`.
-# AWS credentials are required so the API can pull the registered model
-# artifact from S3 via MLflow on startup.
-cat > /opt/modelserve/.env <<ENV
-MLFLOW_TRACKING_URI=http://{infra_private_ip}:5000
-REDIS_HOST={infra_private_ip}
-REDIS_PORT=6379
-MLFLOW_MODEL_NAME=fraud-detection-model
-API_IMAGE={image}
-AWS_ACCESS_KEY_ID={akid}
-AWS_SECRET_ACCESS_KEY={sak}
-AWS_DEFAULT_REGION={region}
-ENV
-chmod 600 /opt/modelserve/.env
-
-cat > /opt/modelserve/docker-compose.yml <<'YAML'
-services:
+    compose_yaml = f"""services:
   api:
     image: ${{API_IMAGE}}
     container_name: modelserve-api
+    # Non-secret env: hard-coded so the container always knows where to find
+    # MLflow / Redis regardless of how `docker compose` is invoked.
     environment:
-      MLFLOW_TRACKING_URI: ${{MLFLOW_TRACKING_URI}}
-      MLFLOW_MODEL_NAME: ${{MLFLOW_MODEL_NAME}}
-      FEAST_REPO_PATH: /app/feast_repo
-      REDIS_HOST: ${{REDIS_HOST}}
-      REDIS_PORT: ${{REDIS_PORT}}
-      AWS_ACCESS_KEY_ID: ${{AWS_ACCESS_KEY_ID}}
-      AWS_SECRET_ACCESS_KEY: ${{AWS_SECRET_ACCESS_KEY}}
-      AWS_DEFAULT_REGION: ${{AWS_DEFAULT_REGION}}
+      MLFLOW_TRACKING_URI: "http://{infra_private_ip}:5000"
+      MLFLOW_MODEL_NAME: "fraud-detection-model"
+      FEAST_REPO_PATH: "/app/feast_repo"
+      REDIS_HOST: "{infra_private_ip}"
+      REDIS_PORT: "6379"
+    # Secret env (AWS creds): pulled at container-start time from a file that
+    # CI/CD writes from GitHub Secrets. NOT baked into the image, NOT in
+    # user-data, NOT in Pulumi state on the host.
+    env_file:
+      - /opt/modelserve/api.env
     # The baked Feast config inside the image points at "redis:6379".
     # We map that hostname to the infra EC2's private IP so the API can
     # reach the real Redis without needing to rewrite the image.
     extra_hosts:
-      - "redis:${{REDIS_HOST}}"
-      - "mlflow:${{REDIS_HOST}}"
-      - "postgres:${{REDIS_HOST}}"
+      - "redis:{infra_private_ip}"
+      - "mlflow:{infra_private_ip}"
+      - "postgres:{infra_private_ip}"
     ports:
       - "8000:8000"
     restart: unless-stopped
@@ -498,7 +471,44 @@ services:
 volumes:
   prometheus_data:
   grafana_data:
-YAML
+"""
+
+    return f"""#!/bin/bash
+{_common_docker_install()}
+
+mkdir -p /opt/modelserve/prometheus
+mkdir -p /opt/modelserve/grafana/provisioning/datasources
+mkdir -p /opt/modelserve/grafana/provisioning/dashboards
+
+cat > /opt/modelserve/prometheus/prometheus.yml <<'PROM'
+{prom_yaml}
+PROM
+
+cat > /opt/modelserve/grafana/provisioning/datasources/prometheus.yml <<'DS'
+{grafana_ds}
+DS
+
+cat > /opt/modelserve/grafana/provisioning/dashboards/dashboards.yml <<'DBPROV'
+{grafana_dashboards_provider}
+DBPROV
+
+{write_dashboard_block}
+# Non-secret runtime config that CI/CD may override (mainly API_IMAGE tag).
+cat > /opt/modelserve/.env <<ENV
+API_IMAGE={image}
+ENV
+chmod 644 /opt/modelserve/.env
+
+# Placeholder for runtime secrets that CI/CD populates from GitHub Secrets on
+# every deploy. The compose file references this via `env_file:`. Creating it
+# empty here lets `docker compose up` succeed on first boot — the API will
+# start but report unhealthy until CI/CD fills in the real AWS credentials.
+touch /opt/modelserve/api.env
+chmod 600 /opt/modelserve/api.env
+chown ubuntu:ubuntu /opt/modelserve/api.env
+
+cat > /opt/modelserve/docker-compose.yml <<'YAML'
+{compose_yaml}YAML
 
 cd /opt/modelserve
 # Pull API image best-effort (it may not exist yet on first boot — CI/CD will deploy it later).
@@ -531,8 +541,6 @@ infra_host = aws.ec2.Instance(
 monitoring_userdata = pulumi.Output.all(
     infra_host.private_ip,
     pulumi.Output.from_input(docker_image),
-    aws_access_key_id,
-    aws_secret_access_key,
 ).apply(make_monitoring_userdata)
 
 monitoring_host = aws.ec2.Instance(

@@ -4,14 +4,18 @@ name: build-and-deploy
 #   1. Run tests
 #   2. Build the FastAPI Docker image
 #   3. Push it to Docker Hub
-#   4. SSH into the monitoring EC2 host, pull the new image, and restart the api container.
+#   4. SSH into the monitoring EC2 host, write the runtime secret env file
+#      from GitHub Secrets, pull the new image, and restart the api container.
 #
 # Required GitHub Secrets:
-#   DOCKERHUB_USERNAME   Docker Hub username
-#   DOCKERHUB_TOKEN      Docker Hub access token
-#   DOCKER_IMAGE         Full image name without tag, e.g. mahianol/modelserve-api
-#   EC2_HOST             Public IP of the monitoring-host EC2 (Pulumi output: monitoring_host_public_ip)
-#   EC2_SSH_KEY          Contents of ~/.ssh/modelserve-key (the private key, PEM format)
+#   DOCKERHUB_USERNAME      Docker Hub username
+#   DOCKERHUB_TOKEN         Docker Hub access token
+#   DOCKER_IMAGE            Full image name without tag, e.g. mahianol/modelserve-api
+#   EC2_HOST                Public IP of the monitoring-host EC2 (Pulumi output: monitoring_host_public_ip)
+#   EC2_SSH_KEY             Contents of ~/.ssh/modelserve-key (private key, PEM format)
+#   AWS_ACCESS_KEY_ID       AWS key the API uses to download the model from S3 via MLflow
+#   AWS_SECRET_ACCESS_KEY   AWS secret pair
+#   AWS_DEFAULT_REGION      AWS region (e.g. ap-southeast-1)
 
 on:
   push:
@@ -64,16 +68,46 @@ jobs:
     steps:
       - name: Deploy to monitoring EC2 host
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ secrets.AWS_DEFAULT_REGION }}
+          DOCKER_IMAGE_TAG:      ${{ secrets.DOCKER_IMAGE }}:latest
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
+          # Forward the env vars above into the SSH session so we can reference
+          # them as shell variables in the script. This keeps the secret values
+          # out of the rendered script body in clear text.
+          envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_DEFAULT_REGION,DOCKER_IMAGE_TAG
           script: |
-            set -eux
+            set -eu
             cd /opt/modelserve
-            # Ensure the .env points at the latest image tag (it already does by default,
-            # but this also lets you pin to a specific SHA if you want).
-            sudo sed -i "s|^API_IMAGE=.*|API_IMAGE=${{ secrets.DOCKER_IMAGE }}:latest|" .env
-            sudo docker compose pull api
-            sudo docker compose up -d --force-recreate api
+
+            # 1. Write runtime secrets to /opt/modelserve/api.env. The compose
+            #    file references this via `env_file:` so the api container
+            #    picks them up on (re)start. The file is created by Pulumi
+            #    user-data as an empty placeholder on first boot.
+            sudo tee /opt/modelserve/api.env > /dev/null <<EOF
+            AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+            AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+            AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+            EOF
+            sudo chmod 600 /opt/modelserve/api.env
+            sudo chown ubuntu:ubuntu /opt/modelserve/api.env
+
+            # 2. Point .env at the freshly built image tag (the compose file
+            #    references $API_IMAGE for the api service image).
+            sudo sed -i "s|^API_IMAGE=.*|API_IMAGE=${DOCKER_IMAGE_TAG}|" .env
+
+            # 3. Pull the new image and recreate the api container.
+            sudo docker compose --env-file .env pull api
+            sudo docker compose --env-file .env up -d --force-recreate api
             sudo docker image prune -f
+
+            # 4. Quick smoke check (don't fail the build on this — the model
+            #    download from S3 can take ~30s, so /health may legitimately
+            #    say unhealthy for a moment after recreate).
+            sleep 10
+            curl -fsS http://localhost:8000/health || echo "Health not yet ready — model may still be loading."
