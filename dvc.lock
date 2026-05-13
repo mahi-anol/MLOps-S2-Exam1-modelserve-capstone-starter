@@ -1,0 +1,181 @@
+schema: '2.0'
+stages:
+  data_ingestion:
+    cmd: python -m src.Pipelines.Data_Ingestion.data_ingestion
+    deps:
+    - path: src/Logger/__init__.py
+      hash: md5
+      md5: 146758e6af80cdc49a8888f22df841cf
+      size: 1374
+    - path: src/Pipelines/Data_Ingestion/data_ingestion.py
+      hash: md5
+      md5: b15613221e17cbd6c79053c97870553d
+      size: 1176
+    params:
+      params.yaml:
+        data_ingestion.ingestion_location: ./data/raw
+        data_ingestion.kaggle_data_source: kartik2112/fraud-detection
+    outs:
+    - path: data/raw
+      hash: md5
+      md5: 7e99aa0bbea5ccf32367a5c90049bc51.dir
+      size: 501592535
+      nfiles: 3
+  data_preprocessing:
+    cmd: python -m src.Pipelines.Data_Preprocessing.data_preprocessing
+    deps:
+    - path: data/raw
+      hash: md5
+      md5: 7e99aa0bbea5ccf32367a5c90049bc51.dir
+      size: 501592535
+      nfiles: 3
+    - path: src/Logger/__init__.py
+      hash: md5
+      md5: 146758e6af80cdc49a8888f22df841cf
+      size: 1374
+    - path: src/Pipelines/Data_Preprocessing/data_preprocessing.py
+      hash: md5
+      md5: 1b90ca41353c4ff1397af32f9f12c366
+      size: 6903
+    params:
+      params.yaml:
+        preprocessing.categorical_columns:
+        - merchant
+        - category
+        - gender
+        - state
+        preprocessing.drop_columns:
+        - 'Unnamed: 0'
+        - first
+        - last
+        - street
+        - city
+        - zip
+        - lat
+        - long
+        - city_pop
+        - job
+        - dob
+        - trans_num
+        - unix_time
+        - merch_lat
+        - merch_long
+        preprocessing.handle_imbalance: false
+        preprocessing.numerical_columns:
+        - amt
+        - hour
+        - day_of_week
+        - month
+        preprocessing.output_dir: ./data/processed
+        preprocessing.raw_test_path: ./data/raw/fraudTest.csv
+        preprocessing.raw_train_path: ./data/raw/fraudTrain.csv
+        preprocessing.scale_features: true
+        preprocessing.target_column: is_fraud
+    outs:
+    - path: data/processed
+      hash: md5
+      md5: 5979dbfa19144479280ab90e68a552ae.dir
+      size: 199912756
+      nfiles: 2
+  feature_engineering:
+    cmd: python -m src.Pipelines.Feature_Engineering.feature_engineering
+    deps:
+    - path: data/processed
+      hash: md5
+      md5: 5979dbfa19144479280ab90e68a552ae.dir
+      size: 199912756
+      nfiles: 2
+    - path: src/Logger/__init__.py
+      hash: md5
+      md5: 146758e6af80cdc49a8888f22df841cf
+      size: 1374
+    - path: src/Pipelines/Feature_Engineering/feature_engineering.py
+      hash: md5
+      md5: 7989c8ffea1f7d1ed80d4ef58a495558
+      size: 6224
+    params:
+      params.yaml:
+        feature_engineering.artifacts_dir: ./artifacts/feature_engineering
+        feature_engineering.output_dir: ./data/features
+        feature_engineering.processed_test_path: 
+          ./data/processed/test_processed.csv
+        feature_engineering.processed_train_path: 
+          ./data/processed/train_processed.csv
+        feature_engineering.target_column: is_fraud
+        feature_engineering.time_of_day_bins:
+        - 0
+        - 6
+        - 12
+        - 18
+        - 24
+        feature_engineering.time_of_day_labels:
+        - Night
+        - Morning
+        - Afternoon
+        - Evening
+    outs:
+    - path: artifacts/feature_engineering
+      hash: md5
+      md5: e6785b953fa3d009184eb7081237ef5d.dir
+      size: 862
+      nfiles: 1
+    - path: data/features
+      hash: md5
+      md5: 1e90e98849d9018e52b505ea4f97bb2d.dir
+      size: 54809322
+      nfiles: 2
+  feast_preprocess:
+    cmd: python -m src.Pipelines.Feature_Store.feast_preprocess
+    deps:
+    - path: data/features
+      hash: md5
+      md5: 1e90e98849d9018e52b505ea4f97bb2d.dir
+      size: 54809322
+      nfiles: 2
+    - path: src/Pipelines/Feature_Store/feast_preprocess.py
+      hash: md5
+      md5: ac78b22c9699db7462a6db63a1378572
+      size: 3160
+    params:
+      params.yaml:
+        feast_preprocess.entity_column: cc_num
+        feast_preprocess.feature_data_path: 
+          ./data/features/train_features.parquet
+        feast_preprocess.output_path: ./training/features.parquet
+        feast_preprocess.target_column: is_fraud
+    outs:
+    - path: training/features.parquet
+      hash: md5
+      md5: 20cf25cfb4cdea21c6f09264256ba6dd
+      size: 83358
+  model_training:
+    cmd: python -m src.Pipelines.Model_Training.model_training
+    deps:
+    - path: data/features
+      hash: md5
+      md5: 1e90e98849d9018e52b505ea4f97bb2d.dir
+      size: 54809322
+      nfiles: 2
+    - path: src/Pipelines/Model_Training/model_training.py
+      hash: md5
+      md5: a7bd84c868087f702d54c5cafd007ad4
+      size: 7397
+    params:
+      params.yaml:
+        model_training.algorithm: xgboost
+        model_training.entity_column: cc_num
+        model_training.features_path: ./data/features/train_features.parquet
+        model_training.hyperparameters:
+          n_estimators: 100
+          max_depth: 6
+          learning_rate: 0.1
+          scale_pos_weight: 50
+          eval_metric: logloss
+          random_state: 42
+        model_training.model_name: fraud-detection-model
+        model_training.target_column: is_fraud
+    outs:
+    - path: training/sample_request.json
+      hash: md5
+      md5: a9262e372e459e3ae9f4b7c96acf9e4f
+      size: 35

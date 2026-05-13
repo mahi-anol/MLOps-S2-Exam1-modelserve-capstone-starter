@@ -42,6 +42,17 @@ Infra lives in AWS. Training happens on your local machine and pushes the model 
 
 ## Three steps to "fully up"
 
+
+### Repo setup
+```
+ssh-keygen -t ed25519 -C "anol.mahi@gmail.com"
+eval "$(ssh-agent -s)"
+ssh-add ~/.ssh/id_ed25519
+cat ~/.ssh/id_ed25519.pub
+git config --global user.name "Mahi"
+git config --global user.email "anol.mahi@gmail.com"
+
+```
 ### Step 1 — Provision the AWS infra (local)
 
 ```bash

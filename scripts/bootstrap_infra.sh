@@ -46,6 +46,8 @@ if ! command -v aws >/dev/null 2>&1; then
   sudo ./aws/install || sudo ./aws/install --update
   popd >/dev/null
   rm -rf "$TMPDIR"
+  echo "updating ubuntu repo and adding venv"
+  sudo apt update -y && sudo apt upgrade -y && sudo apt install python3.12-venv -y
 else
   echo "[1/5] AWS CLI already installed: $(aws --version)"
 fi
