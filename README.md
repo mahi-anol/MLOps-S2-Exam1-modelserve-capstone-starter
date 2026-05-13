@@ -11,31 +11,61 @@ Built with FastAPI, MLflow, Feast, Redis, Postgres, Prometheus, Grafana, Docker,
 
 Infra lives in AWS. Training happens on your local machine and pushes the model to the remote MLflow registry (artifacts go to S3). The FastAPI image is built + pushed by GitHub Actions on every push to `main`, then pulled and run on the monitoring EC2 host.
 
-```
-                             AWS
-  ┌───────────────────────────────────────────────────────────┐
-  │  VPC (10.0.0.0/16)                                        │
-  │   ├─ public subnet (EC2s)                                 │
-  │   ├─ private subnet (reserved)                            │
-  │   ├─ IGW, NAT, route tables                               │
-  │   │                                                       │
-  │   ├─ EC2 #1: infra-host (t3.medium)                       │
-  │   │   • Postgres   (MLflow backend store)                 │
-  │   │   • Redis      (Feast online store)                   │
-  │   │   • MLflow     (tracking server, S3 artifact root) ───┼──► S3 bucket
-  │   │                                                       │
-  │   └─ EC2 #2: monitoring-host (t3.medium)                  │
-  │       • Prometheus                                        │
-  │       • Grafana                                           │
-  │       • FastAPI    (pulled from Docker Hub by CI/CD)      │
-  └───────────────────────────────────────────────────────────┘
-              ▲                          ▲
-              │ pulumi up                │ ssh + docker pull
-              │                          │
-        ┌─────┴────────┐         ┌───────┴─────────┐
-        │ Local machine│         │ GitHub Actions  │
-        │ (training)   │         │ on push to main │
-        └──────────────┘         └─────────────────┘
+```mermaid
+flowchart TB
+    subgraph Local["💻 Local Machine"]
+        LM["pulumi up<br/>bootstrap_train.sh<br/>→ MLflow registry<br/>→ Feast materialize"]
+    end
+
+    subgraph GHA["⚙️ GitHub Actions Runner"]
+        GH["SSH + docker pull<br/>(on push to main)"]
+    end
+
+    subgraph AWS["☁️ AWS — Pulumi-managed VPC (10.0.0.0/16)"]
+        direction TB
+        subgraph VPC["Public + Private Subnets • IGW • NAT • SG"]
+            direction LR
+            subgraph EC2_1["🖥️ EC2 #1: infra-host"]
+                PG[("🐘 Postgres<br/>MLflow DB")]
+                RD[("🔴 Redis<br/>Feast")]
+                ML["📊 MLflow<br/>S3 root"]
+            end
+            subgraph EC2_2["🖥️ EC2 #2: monitoring-host"]
+                PR["📈 Prometheus"]
+                GR["📉 Grafana"]
+                API["⚡ FastAPI<br/>Docker Hub"]
+            end
+            EC2_2 -->|scrape / query| EC2_1
+        end
+        S3[("🪣 S3 Bucket<br/>MLflow Artifacts")]
+        EC2_1 --> S3
+    end
+
+    subgraph Pipeline["🔁 Offline Pipeline (bootstrap_train.sh → dvc repro)"]
+        direction TB
+        K["📦 Kaggle Dataset"] --> DI["data_ingestion"]
+        DI --> DP["data_preprocessing"]
+        DP --> FE["feature_engineering"]
+        FE --> FP["feast_preprocess"]
+        FP --> MT["🎯 model_training<br/>(logs run + registers model<br/>Stage: Production<br/>artifacts → S3)"]
+    end
+
+    LM ==>|deploys infra & trains| AWS
+    GH ==>|deploys API| EC2_2
+    Pipeline -.->|registers model| ML
+    MT -.->|uploads artifacts| S3
+
+    classDef awsBox fill:#FF9900,stroke:#232F3E,stroke-width:2px,color:#fff
+    classDef ec2Box fill:#EC7211,stroke:#232F3E,stroke-width:1px,color:#fff
+    classDef storeBox fill:#3B48CC,stroke:#232F3E,stroke-width:1px,color:#fff
+    classDef pipelineBox fill:#1168BD,stroke:#0B4884,stroke-width:1px,color:#fff
+    classDef localBox fill:#4CAF50,stroke:#2E7D32,stroke-width:1px,color:#fff
+
+    class AWS awsBox
+    class EC2_1,EC2_2 ec2Box
+    class S3,PG,RD storeBox
+    class K,DI,DP,FE,FP,MT pipelineBox
+    class LM,GH localBox
 ```
 
 See `docs/ARCHITECTURE.md` for ADRs and design rationale.
