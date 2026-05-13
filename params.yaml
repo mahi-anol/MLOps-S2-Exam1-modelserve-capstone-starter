@@ -1,0 +1,74 @@
+data_ingestion:
+  kaggle_data_source: "kartik2112/fraud-detection"
+  ingestion_location: "./data/raw"
+
+preprocessing:
+  raw_train_path: "./data/raw/fraudTrain.csv"
+  raw_test_path:  "./data/raw/fraudTest.csv"
+  output_dir:     "./data/processed"
+  target_column:  "is_fraud"
+  handle_imbalance: false
+  scale_features:   true
+  # NOTE: cc_num is intentionally NOT dropped — it is the Feast entity key.
+  drop_columns:
+    - "Unnamed: 0"
+    - "first"
+    - "last"
+    - "street"
+    - "city"
+    - "zip"
+    - "lat"
+    - "long"
+    - "city_pop"
+    - "job"
+    - "dob"
+    - "trans_num"
+    - "unix_time"
+    - "merch_lat"
+    - "merch_long"
+  categorical_columns:
+    - "merchant"
+    - "category"
+    - "gender"
+    - "state"
+  numerical_columns:
+    - "amt"
+    - "hour"
+    - "day_of_week"
+    - "month"
+  # cc_num is carried forward as-is (not encoded, not scaled)
+  passthrough_columns:
+    - "cc_num"
+
+feature_engineering:
+  processed_train_path: "./data/processed/train_processed.csv"
+  processed_test_path:  "./data/processed/test_processed.csv"
+  output_dir:           "./data/features"
+  artifacts_dir:        "./artifacts/feature_engineering"
+  target_column:        "is_fraud"
+  time_of_day_bins:     [0, 6, 12, 18, 24]
+  time_of_day_labels:   ["Night", "Morning", "Afternoon", "Evening"]
+
+feast_preprocess:
+  feature_data_path: "./data/features/train_features.parquet"
+  output_path: "./training/features.parquet"
+  entity_column: "cc_num"
+  target_column: "is_fraud"
+  timestamp_column: "event_timestamp"
+
+model_training:
+  features_path: "./data/features/train_features.parquet"
+  test_features_path: "./data/features/test_features.parquet"
+  target_column: "is_fraud"
+  entity_column: "cc_num"
+  model_name: "fraud-detection-model"
+  algorithm: "xgboost"
+  mlflow_tracking_uri: "http://localhost:5000"
+  sample_request_path: "./training/sample_request.json"
+  hyperparameters:
+    n_estimators: 100
+    max_depth: 6
+    learning_rate: 0.1
+    scale_pos_weight: 50
+    eval_metric: "logloss"
+    random_state: 42

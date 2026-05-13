@@ -1,0 +1,10 @@
+encryptionsalt: v1:H9GiZf8tRFI=:v1:ElajlSLAnGlYeANf:Jdb9sQq9FIF5RUWcovUpBdAiaXK6VA==
+config:
+  aws:region: ap-southeast-1
+  modelserve-infra:publicKey: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC8O+Iw1dm/iNdC2vBx9C/pQACLxT6qf4nq+JLtWHfPZh6m9Y/Ak49HiLDXgL3UiPXQ54z2oCLxipCHroT9YcKfMMO70o3Knni00lgpsXMKqo2aarnZKCbYOWYZCLhCI7Wuxzij8KC4Mp0AT/n0z0d8ZznsMKulxAKYd933TjDFeJY2ikxeJOv+eudAjr8L0CUcptGVwgnRjXNrqUIDp3AszKSYq2TTPj4tOqz982Hw78AsYPLT0ESUUChnJNK9s0Ox234jie6iMldVzzL/DDA+1gxF4a5ILLwunicWNWvH0TWu6vIwIwJJxXoVA5OOFtQ9mBcJK/Zoa3t0exQyK2WqLz44EvFbzh/oo1lkergLQSl6qTFF5/TovGF0TC0bI2GUJyMYmIOol7e/5jTLsa30wgO62/zQMUVczjpWhzdvzvemqIoT8KSA5Swx8bjgkP8R1X9XB9/gLIDssOrstnjWO1gLzRZ1imaAnrwVwIjgc1k5Hd/N6mE88AJWqAGD+GprF5IWatTo1s9KQbfYUsknVJRJjnLZdjuB1N4TPafbBUaB25IFqx5DXNEBlIuzHe4+BjrkHSMLZasL/qUD3zLrQzy5Rs9E4zhTiXmhOeRzNMNeRGCg2erzMXo/8L+F5DIFnUOCHnBXEyRZ6SzZv12KgbMxtvBJO9BbJlfpanwjPw== poridhian@257889045b564b93
+  modelserve-infra:awsAccessKeyId:
+    secure: v1:zp+0Kycnyh0SR5b5:pT3X/nUpaLV9V3n+RDTsy9Ny2v/gG0V/A/Mc8rbJlW/yVVZ+
+  modelserve-infra:awsSecretAccessKey:
+    secure: v1:f6HeszerwGiqgG9G:nHtzQxRB+H5uhLv/a38wnUtjGusUSSewbqskWb426jScJXsYEEFRFExuPwPCJMEh4tWZCivQm9c=
+  modelserve-infra:dockerHubUser: mahianol
+  modelserve-infra:dockerImage: mahianol/modelserve-api:latest

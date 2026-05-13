@@ -1,0 +1,88 @@
+stages:
+  data_ingestion:
+    cmd: python -m src.Pipelines.Data_Ingestion.data_ingestion
+    deps:
+      - src/Pipelines/Data_Ingestion/data_ingestion.py
+      - src/Logger/__init__.py
+    outs:
+      - data/raw:
+          cache: true
+          persist: true
+    params:
+      - data_ingestion.kaggle_data_source
+      - data_ingestion.ingestion_location
+
+  data_preprocessing:
+    cmd: python -m src.Pipelines.Data_Preprocessing.data_preprocessing
+    deps:
+      - src/Pipelines/Data_Preprocessing/data_preprocessing.py
+      - src/Logger/__init__.py
+      - data/raw
+    outs:
+      - data/processed:
+          cache: true
+          persist: true
+    params:
+      - preprocessing.raw_train_path
+      - preprocessing.raw_test_path
+      - preprocessing.output_dir
+      - preprocessing.target_column
+      - preprocessing.handle_imbalance
+      - preprocessing.scale_features
+      - preprocessing.drop_columns
+      - preprocessing.categorical_columns
+      - preprocessing.numerical_columns
+
+  feature_engineering:
+    cmd: python -m src.Pipelines.Feature_Engineering.feature_engineering
+    deps:
+      - src/Pipelines/Feature_Engineering/feature_engineering.py
+      - src/Logger/__init__.py
+      - data/processed
+    outs:
+      - data/features:
+          cache: true
+          persist: true
+      - artifacts/feature_engineering:
+          cache: true
+          persist: true
+    params:
+      - feature_engineering.processed_train_path
+      - feature_engineering.processed_test_path
+      - feature_engineering.output_dir
+      - feature_engineering.artifacts_dir
+      - feature_engineering.target_column
+      - feature_engineering.time_of_day_bins
+      - feature_engineering.time_of_day_labels
+
+  feast_preprocess:
+    cmd: python -m src.Pipelines.Feature_Store.feast_preprocess
+    deps:
+      - src/Pipelines/Feature_Store/feast_preprocess.py
+      - data/features
+    outs:
+      - training/features.parquet:
+          cache: false
+          persist: true
+    params:
+      - feast_preprocess.feature_data_path
+      - feast_preprocess.output_path
+      - feast_preprocess.entity_column
+      - feast_preprocess.target_column
+
+  model_training:
+    cmd: python -m src.Pipelines.Model_Training.model_training
+    deps:
+      - src/Pipelines/Model_Training/model_training.py
+      - data/features
+    outs:
+      - training/sample_request.json:
+          cache: false
+          persist: true
+    params:
+      - model_training.features_path
+      - model_training.target_column
+      - model_training.entity_column
+      - model_training.model_name
+      - model_training.algorithm
+      - model_training.hyperparameters

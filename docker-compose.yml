@@ -1,24 +1,140 @@
 # ============================================================================
-# ModelServe — Docker Compose (Local Development)
+# ModelServe — Docker Compose (Local Development Stack)
 # ============================================================================
-# TODO: Define your complete local development stack.
-#
-# Required services:
-#   - PostgreSQL (MLflow backend store)
-#   - Redis (Feast online store)
-#   - MLflow Tracking Server (depends on Postgres)
-#   - FastAPI Inference Service (depends on MLflow, Redis)
-#   - Prometheus (scrapes FastAPI /metrics) — add in Sessions 3-4
-#   - Grafana (reads from Prometheus) — add in Sessions 3-4
-#
-# For each service, consider:
-#   - Which Docker image to use
-#   - What ports to expose
-#   - What environment variables to pass
-#   - What volumes to mount for persistence
-#   - What healthcheck to configure
-#   - What depends_on relationships exist
-#   - What network to attach to
-#
-# The entire stack must start with a single: docker compose up
+
 # ============================================================================
+# ModelServe — Docker Compose (Local Development + EC2 Deployment)
+# ============================================================================
+# Usage:
+#   Local:  docker compose up -d
+#   EC2:    API_IMAGE=<ecr-url>:latest docker compose up -d
+# ============================================================================
+
+services:
+
+  # --- Postgres (MLflow backend store) ---
+  postgres:
+    image: postgres:15-alpine
+    container_name: modelserve-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mlflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mlflow_password}
+      POSTGRES_DB: ${POSTGRES_DB:-mlflow_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mlflow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # --- Redis (Feast online store) ---
+  redis:
+    image: redis:7-alpine
+    container_name: modelserve-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # --- MLflow Tracking Server ---
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/mlflow/Dockerfile
+    container_name: modelserve-mlflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://${POSTGRES_USER:-mlflow}:${POSTGRES_PASSWORD:-mlflow_password}@postgres:5432/${POSTGRES_DB:-mlflow_db}
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://${POSTGRES_USER:-mlflow}:${POSTGRES_PASSWORD:-mlflow_password}@postgres:5432/${POSTGRES_DB:-mlflow_db}
+      --serve-artifacts
+      --artifacts-destination /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\""]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+
+  # --- FastAPI Inference Service ---
+  # Uses local build by default; set API_IMAGE env var for ECR image on EC2
+  api:
+    image: ${API_IMAGE:-}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: modelserve-api
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_MODEL_NAME: ${MLFLOW_MODEL_NAME:-fraud-detection-model}
+      FEAST_REPO_PATH: /app/feast_repo
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  # --- Prometheus ---
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: modelserve-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    restart: unless-stopped
+
+  # --- Grafana ---
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: modelserve-grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  mlflow_artifacts:
+  prometheus_data:
+  grafana_data:

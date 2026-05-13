@@ -1,30 +1,29 @@
-# ============================================================================
-# ModelServe — Prometheus Alert Rules
-# ============================================================================
-# TODO: Define at least THREE alert rules.
-#
-# Required alerts:
-#   1. High prediction latency
-#      - Trigger when p95 latency exceeds your chosen threshold for 5 minutes
-#      - Hint: histogram_quantile(0.95, rate(prediction_duration_seconds_bucket[5m]))
-#      - Severity: warning
-#
-#   2. Elevated error rate
-#      - Trigger when error rate exceeds 5% for 2 minutes
-#      - Hint: rate(prediction_errors_total[2m]) / rate(prediction_requests_total[2m])
-#      - Severity: warning
-#
-#   3. Service down
-#      - Trigger when the FastAPI service is unreachable for 1 minute
-#      - Hint: up{job="your-job-name"} == 0
-#      - Severity: critical
-#
-# Each alert needs:
-#   - alert: <name>
-#   - expr: <PromQL expression>
-#   - for: <duration>
-#   - labels: severity
-#   - annotations: summary and description
-#
-# The TA will verify these alerts exist and may trigger them during the demo.
-# ============================================================================
+groups:
+  - name: modelserve_alerts
+    rules:
+      - alert: HighLatencyP95
+        expr: histogram_quantile(0.95, rate(prediction_duration_seconds_bucket[5m])) > 0.5
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P95 prediction latency above 500ms"
+          description: "P95 latency is {{ $value }}s"
+
+      - alert: HighErrorRate
+        expr: rate(prediction_errors_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Elevated prediction error rate"
+          description: "Error rate is {{ $value }}/s"
+
+      - alert: ServiceDown
+        expr: up{job="modelserve-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ModelServe API is down"
+          description: "FastAPI service unreachable"
