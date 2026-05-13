@@ -21,6 +21,12 @@ Notes:
   - The Grafana dashboard provider config and the dashboard JSON itself are
     baked into user-data so Grafana auto-loads the ModelServe dashboard on
     first boot — no manual import required.
+  - The Prometheus alert rules (alerts.yml) are also baked into user-data
+    and mounted into the Prometheus container so the Alerts tab is populated
+    on first boot.
+  - User-data is gzip+base64 encoded before being handed to EC2. EC2's
+    user-data hard limit is 16 KB of *encoded* bytes; cloud-init auto-
+    decompresses gzip, so this gives us ~3-4x more headroom for free.
   - User-data scripts install Docker + Compose and start the appropriate stack.
 
 Required Pulumi config:
@@ -32,6 +38,8 @@ Required Pulumi config:
   - dockerImage                (e.g. mahianol/modelserve-api:latest)
 """
 
+import base64
+import gzip
 import json
 import os
 
@@ -52,6 +60,31 @@ aws_cfg = pulumi.Config("aws")
 region = aws_cfg.get("region") or "ap-southeast-1"
 
 project = "modelserve"
+
+
+# ---------------------------------------------------------------------------
+# Helper: gzip + base64 encode a user-data script.
+#
+# EC2 enforces a 16 KB ceiling on the *encoded* user-data payload. Cloud-init
+# transparently decompresses gzip user-data, so the simplest way to stay under
+# the limit (without splitting files out to S3) is to compress before sending.
+# Typical reduction for our shell+YAML+JSON payload: ~3-4x.
+# ---------------------------------------------------------------------------
+def _gzip_b64(script: str) -> str:
+    compressed = gzip.compress(script.encode("utf-8"), compresslevel=9)
+    encoded = base64.b64encode(compressed).decode("ascii")
+    pulumi.log.info(
+        f"user-data: raw={len(script)}B, gzipped={len(compressed)}B, "
+        f"base64={len(encoded)}B (EC2 limit: 16384B)"
+    )
+    if len(encoded) > 16384:
+        pulumi.log.warn(
+            f"user-data after gzip+base64 is {len(encoded)}B, still over the "
+            "16 KB EC2 limit. Consider trimming the dashboard JSON or "
+            "fetching it from S3 in user-data instead of baking it in."
+        )
+    return encoded
+
 
 # ---------------------------------------------------------------------------
 # Read the local Grafana dashboard JSON so we can bake it into user-data.
@@ -80,6 +113,28 @@ except FileNotFoundError:
         "Grafana will start with no pre-provisioned dashboard."
     )
     dashboard_json_minified = ""
+
+# Read Prometheus alert rules from the local repo so we can bake them into
+# user-data. Without this, Prometheus boots with no rules and the Alerts tab
+# stays empty.
+_alerts_yml_path = os.path.normpath(
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "monitoring",
+        "prometheus",
+        "alerts.yml",
+    )
+)
+try:
+    with open(_alerts_yml_path, "r") as _f:
+        alerts_yml_contents = _f.read()
+except FileNotFoundError:
+    pulumi.log.warn(
+        f"Prometheus alerts.yml not found at {_alerts_yml_path} — "
+        "Prometheus will start with no alert rules."
+    )
+    alerts_yml_contents = ""
 
 # ---------------------------------------------------------------------------
 # Networking
@@ -359,6 +414,10 @@ def make_monitoring_userdata(args) -> str:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# Load alert rules from alerts.yml (mounted at /etc/prometheus/alerts.yml).
+rule_files:
+  - /etc/prometheus/alerts.yml
+
 scrape_configs:
   - job_name: 'prometheus'
     static_configs:
@@ -410,6 +469,16 @@ providers:
 DASHBOARD
 """
 
+    # Same idea for the Prometheus alerts.yml — emit a quoted heredoc so the
+    # YAML isn't subject to bash variable expansion. Only emitted if we
+    # actually loaded the file at module level.
+    write_alerts_block = ""
+    if alerts_yml_contents:
+        write_alerts_block = f"""cat > /opt/modelserve/prometheus/alerts.yml <<'ALERTS'
+{alerts_yml_contents}
+ALERTS
+"""
+
     compose_yaml = f"""services:
   api:
     image: ${{API_IMAGE}}
@@ -445,6 +514,7 @@ DASHBOARD
       - "9090:9090"
     volumes:
       - /opt/modelserve/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - /opt/modelserve/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus_data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -484,6 +554,16 @@ cat > /opt/modelserve/prometheus/prometheus.yml <<'PROM'
 {prom_yaml}
 PROM
 
+{write_alerts_block}
+# Safety net: if alerts.yml wasn't baked in (file missing at deploy time),
+# create an empty rule file so Prometheus doesn't fail to start on the
+# `rule_files:` reference. An empty groups list is valid.
+if [ ! -f /opt/modelserve/prometheus/alerts.yml ]; then
+  cat > /opt/modelserve/prometheus/alerts.yml <<'EMPTYALERTS'
+groups: []
+EMPTYALERTS
+fi
+
 cat > /opt/modelserve/grafana/provisioning/datasources/prometheus.yml <<'DS'
 {grafana_ds}
 DS
@@ -521,9 +601,11 @@ docker compose --env-file .env up -d api || echo "API image not yet available �
 # ---------------------------------------------------------------------------
 # EC2 Instances
 # ---------------------------------------------------------------------------
-infra_userdata = pulumi.Output.all(
+# Build user-data, then gzip+base64 it. Cloud-init auto-decompresses, so the
+# scripts run exactly as before — we just sneak under EC2's 16 KB ceiling.
+infra_userdata_b64 = pulumi.Output.all(
     artifact_bucket.bucket, aws_access_key_id, aws_secret_access_key
-).apply(make_infra_userdata)
+).apply(lambda args: _gzip_b64(make_infra_userdata(args)))
 
 infra_host = aws.ec2.Instance(
     f"{project}-infra-host",
@@ -534,14 +616,14 @@ infra_host = aws.ec2.Instance(
     key_name=key_pair.key_name,
     associate_public_ip_address=True,
     root_block_device={"volume_size": 30, "volume_type": "gp3"},
-    user_data=infra_userdata,
+    user_data_base64=infra_userdata_b64,
     tags={"Name": f"{project}-infra-host", "Role": "mlflow-redis-postgres"},
 )
 
-monitoring_userdata = pulumi.Output.all(
+monitoring_userdata_b64 = pulumi.Output.all(
     infra_host.private_ip,
     pulumi.Output.from_input(docker_image),
-).apply(make_monitoring_userdata)
+).apply(lambda args: _gzip_b64(make_monitoring_userdata(args)))
 
 monitoring_host = aws.ec2.Instance(
     f"{project}-monitoring-host",
@@ -552,7 +634,7 @@ monitoring_host = aws.ec2.Instance(
     key_name=key_pair.key_name,
     associate_public_ip_address=True,
     root_block_device={"volume_size": 30, "volume_type": "gp3"},
-    user_data=monitoring_userdata,
+    user_data_base64=monitoring_userdata_b64,
     tags={"Name": f"{project}-monitoring-host", "Role": "prometheus-grafana-api"},
     opts=pulumi.ResourceOptions(depends_on=[infra_host]),
 )
