@@ -10,13 +10,15 @@ Provisions:
   - 2 x t3.medium EC2 instances:
       * infra-host        -> Postgres, Redis, MLflow
       * monitoring-host   -> Prometheus, Grafana, FastAPI (deployed via CI/CD)
-  - 1 S3 bucket (MLflow artifact registry)
+  - 1 S3 bucket (MLflow artifact registry + Grafana provisioning files)
 
 Notes:
   - This stack does NOT create any IAM users (account has restricted access).
   - AWS credentials (configured via `aws configure`) are passed into the
     MLflow container as env vars so it can read/write the S3 bucket.
-  - User-data scripts install Docker + Compose and start the appropriate stack.
+  - The Grafana dashboard JSON + dashboards.yml are uploaded to S3 by Pulumi
+    so the monitoring host's user-data can pull them down at boot. This
+    sidesteps the 16 KB user-data limit.
 
 Required Pulumi config:
   - aws:region                 (e.g. ap-southeast-1)
@@ -27,6 +29,7 @@ Required Pulumi config:
   - dockerImage                (e.g. mahianol/modelserve-api:latest)
 """
 
+import os
 import pulumi
 import pulumi_aws as aws
 
@@ -44,6 +47,9 @@ aws_cfg = pulumi.Config("aws")
 region = aws_cfg.get("region") or "ap-southeast-1"
 
 project = "modelserve"
+
+# Repo root (one level up from this file's "infrastructure/" folder)
+_repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ---------------------------------------------------------------------------
 # Networking
@@ -162,16 +168,14 @@ key_pair = aws.ec2.KeyPair(
 )
 
 # ---------------------------------------------------------------------------
-# S3 Bucket (MLflow artifact registry)
+# S3 Bucket (MLflow artifact registry + Grafana provisioning files)
 # ---------------------------------------------------------------------------
-# Pulumi auto-appends a random suffix to keep the bucket name unique.
 artifact_bucket = aws.s3.BucketV2(
     f"{project}-artifacts",
     force_destroy=True,
     tags={"Name": f"{project}-artifacts"},
 )
 
-# Block public access (good default)
 aws.s3.BucketPublicAccessBlock(
     f"{project}-artifacts-pab",
     bucket=artifact_bucket.id,
@@ -179,6 +183,25 @@ aws.s3.BucketPublicAccessBlock(
     block_public_policy=True,
     ignore_public_acls=True,
     restrict_public_buckets=True,
+)
+
+# Upload Grafana provisioning files so the monitoring host can fetch them at boot.
+grafana_dashboard_obj = aws.s3.BucketObject(
+    f"{project}-grafana-dashboard",
+    bucket=artifact_bucket.id,
+    key="grafana/modelserve-dashboard.json",
+    source=pulumi.FileAsset(
+        os.path.join(_repo_root, "monitoring/grafana/provisioning/dashboards/modelserve-dashboard.json")
+    ),
+)
+
+grafana_dashboards_yml_obj = aws.s3.BucketObject(
+    f"{project}-grafana-dashboards-yml",
+    bucket=artifact_bucket.id,
+    key="grafana/dashboards.yml",
+    source=pulumi.FileAsset(
+        os.path.join(_repo_root, "monitoring/grafana/provisioning/dashboards/dashboards.yml")
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -304,8 +327,13 @@ docker compose --env-file .env up -d
 
 
 def make_monitoring_userdata(args) -> str:
-    """User-data for EC2 #2: runs Prometheus, Grafana, and the FastAPI image."""
-    infra_private_ip, image = args
+    """User-data for EC2 #2: runs Prometheus, Grafana, and the FastAPI image.
+
+    Also pulls the Grafana dashboard provisioning files from S3 so the
+    dashboard shows up automatically once Grafana boots.
+    """
+    infra_private_ip, image, bucket_name, akid, sak = args
+
     prom_yaml = f"""global:
   scrape_interval: 15s
   evaluation_interval: 15s
@@ -336,6 +364,12 @@ datasources:
     return f"""#!/bin/bash
 {_common_docker_install()}
 
+# AWS CLI is needed to pull the dashboard JSON from S3.
+apt-get install -y awscli
+export AWS_ACCESS_KEY_ID="{akid}"
+export AWS_SECRET_ACCESS_KEY="{sak}"
+export AWS_DEFAULT_REGION="{region}"
+
 mkdir -p /opt/modelserve/prometheus
 mkdir -p /opt/modelserve/grafana/provisioning/datasources
 mkdir -p /opt/modelserve/grafana/provisioning/dashboards
@@ -347,6 +381,12 @@ PROM
 cat > /opt/modelserve/grafana/provisioning/datasources/prometheus.yml <<'DS'
 {grafana_ds}
 DS
+
+# Pull Grafana dashboard provisioning files from S3
+aws s3 cp "s3://{bucket_name}/grafana/dashboards.yml" \\
+  /opt/modelserve/grafana/provisioning/dashboards/dashboards.yml
+aws s3 cp "s3://{bucket_name}/grafana/modelserve-dashboard.json" \\
+  /opt/modelserve/grafana/provisioning/dashboards/modelserve-dashboard.json
 
 # Default endpoints (private VPC IP of the infra host). CI/CD can override these
 # by writing a different .env file before running `docker compose up -d api`.
@@ -444,7 +484,11 @@ infra_host = aws.ec2.Instance(
 )
 
 monitoring_userdata = pulumi.Output.all(
-    infra_host.private_ip, pulumi.Output.from_input(docker_image)
+    infra_host.private_ip,
+    pulumi.Output.from_input(docker_image),
+    artifact_bucket.bucket,
+    aws_access_key_id,
+    aws_secret_access_key,
 ).apply(make_monitoring_userdata)
 
 monitoring_host = aws.ec2.Instance(
@@ -458,7 +502,11 @@ monitoring_host = aws.ec2.Instance(
     root_block_device={"volume_size": 30, "volume_type": "gp3"},
     user_data=monitoring_userdata,
     tags={"Name": f"{project}-monitoring-host", "Role": "prometheus-grafana-api"},
-    opts=pulumi.ResourceOptions(depends_on=[infra_host]),
+    opts=pulumi.ResourceOptions(depends_on=[
+        infra_host,
+        grafana_dashboard_obj,
+        grafana_dashboards_yml_obj,
+    ]),
 )
 
 # ---------------------------------------------------------------------------
