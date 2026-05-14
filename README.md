@@ -131,13 +131,17 @@ On push, `.github/workflows/deploy.yml`:
 
 Required GitHub repo secrets:
 
-| Secret               | Value                                                              |
-|----------------------|--------------------------------------------------------------------|
-| `DOCKERHUB_USERNAME` | Docker Hub username                                                |
-| `DOCKERHUB_TOKEN`    | Docker Hub access token                                            |
-| `DOCKER_IMAGE`       | Full image repo, e.g. `mahianol/modelserve-api` (no tag)           |
-| `EC2_HOST`           | `monitoring_host_public_ip` from Pulumi outputs                    |
-| `EC2_SSH_KEY`        | Contents of `~/.ssh/modelserve-key` (PEM, including BEGIN/END)     |
+| Secret                 | Value                                                              |
+|------------------------|--------------------------------------------------------------------|
+| `DOCKERHUB_USERNAME`   | Docker Hub username                                                |
+| `DOCKERHUB_TOKEN`      | Docker Hub access token                                            |
+| `DOCKER_IMAGE`         | Full image repo, e.g. `mahianol/modelserve-api` (no tag)           |
+| `EC2_HOST`             | `monitoring_host_public_ip` from Pulumi outputs                    |
+| `EC2_SSH_KEY`          | Contents of `~/.ssh/modelserve-key` (PEM, including BEGIN/END)     |
+| `AWS_ACCESS_KEY_ID`    | From AWS creds                                                     |
+| `AWS_DEFAULT_REGION`   | From AWS creds                                                     |
+| `AWS_SECRET_ACCESS_KEY`| From AWS creds                                                     |
+
 
 Done. Hit the endpoints.
 
