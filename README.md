@@ -198,6 +198,15 @@ Returns `400` if the requested version doesn't exist or there's no prior version
 
 ---
 
+
+---
+## Prometheus and Grafana
+![Alt text](docs/Grafana.png)
+You can see the tracked metrices in grana dashboard
+![Alt text](docs/Prometheus.png)
+Notice that alerts got triggered as we intentionally hit with wrong features
+
+
 ## Services and ports
 
 | Service     | Host       | Port |
@@ -212,7 +221,6 @@ Returns `400` if the requested version doesn't exist or there's no prior version
 The API container reaches Postgres / Redis / MLflow via the infra host's **private VPC IP**, mapped through `extra_hosts` in docker-compose so the Feast config baked into the image (`connection_string: redis:6379`) just works.
 
 ---
-
 ## Teardown
 
 ```bash
