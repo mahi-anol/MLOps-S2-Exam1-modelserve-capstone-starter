@@ -202,10 +202,9 @@ Returns `400` if the requested version doesn't exist or there's no prior version
 ---
 ## Prometheus and Grafana
 ![Alt text](docs/Grafana.png)
-You can see the tracked metrices in grana dashboard
+You can see the tracked metrices in grana dashboard. (p95 latency), total prediction etc.
 ![Alt text](docs/Prometheus.png)
-Notice that alerts got triggered as we intentionally hit with wrong features
-
+Notice that alerts got triggered as we intentionally hit with wrong id.
 
 ## Services and ports
 
